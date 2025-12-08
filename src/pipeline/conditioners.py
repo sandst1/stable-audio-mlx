@@ -47,51 +47,63 @@ class NumberEmbedder(nn.Module):
         return out
 
 class Conditioners(nn.Module):
-    def __init__(self):
+    """MLX conditioners that match TFLite interface.
+    
+    Takes prompt and seconds_total, returns cross_attn and global_cond.
+    Internally handles T5 text encoding and time embedding.
+    """
+    def __init__(self, t5_model, tokenizer):
         super().__init__()
-        self.seconds_start = NumberEmbedder(1, 768) # Dim guesses
+        self.t5 = t5_model
+        self.tokenizer = tokenizer
         self.seconds_total = NumberEmbedder(1, 768)
         
     def load_weights(self, cond_state):
         # cond_state: dict from convert.py
         # Keys: conditioner.conditioners.seconds_total.embedder.embedding.0.weights
-        
-        # Split into start/total groups
-        start_weights = {}
         total_weights = {}
         
         for k, v in cond_state.items():
             k_short = k.split("embedder.")[1] # embedding.0.weights...
-            if "seconds_start" in k:
-                start_weights[k_short] = v
-            elif "seconds_total" in k:
+            if "seconds_total" in k:
                 total_weights[k_short] = v
         
         # stable-audio-open-small only has seconds_total, not seconds_start
-        if start_weights:
-            self.seconds_start.load_weights(start_weights)
         if total_weights:
             self.seconds_total.load_weights(total_weights)
-            # If no seconds_start, use seconds_total for both
-            if not start_weights:
-                self.seconds_start = self.seconds_total
 
-    def __call__(self, seconds_start, seconds_total):
-        # inputs are arrays or floats
-        if isinstance(seconds_start, (float, int)):
-            seconds_start = mx.array([seconds_start])
+    def __call__(self, prompt, seconds_total):
+        """Generate conditioning for the given prompt and duration.
+        
+        Args:
+            prompt: Text prompt (str)
+            seconds_total: Duration in seconds (float)
+            
+        Returns:
+            cross_attn: (1, 65, 768) - T5 tokens (64) + time embedding (1)
+            global_cond: (1, 768) - Time embedding for global conditioning
+        """
+        # 1. Tokenize and encode text with T5
+        tokens = self.tokenizer(prompt, return_tensors="np", padding="max_length", 
+                               max_length=128, truncation=True)
+        input_ids = mx.array(tokens["input_ids"])
+        attn_mask = mx.array(tokens["attention_mask"])
+        
+        t5_output = self.t5(input_ids, attn_mask)  # (1, 128, 768)
+        t5_tokens = t5_output[:, :64, :]  # Extract first 64 tokens (1, 64, 768)
+        
+        # 2. Encode time parameter
         if isinstance(seconds_total, (float, int)):
             seconds_total = mx.array([seconds_total])
             
-        emb_start = self.seconds_start(seconds_start)  # (B, 768)
-        emb_total = self.seconds_total(seconds_total)  # (B, 768)
+        time_emb = self.seconds_total(seconds_total)  # (1, 768)
         
-        # stable-audio-open-small uses only seconds_total for global conditioning
-        # (Not concatenated like the larger models)
-        global_cond = emb_total  # (B, 768)
+        # 3. Build outputs (matching TFLite interface)
+        # Global conditioning: time embedding only
+        global_cond = time_emb  # (1, 768)
         
-        # Cross-attention tokens: each as (B, 1, 768) to be concatenated with T5 output
-        cross_attn_start = emb_start[:, None, :]  # (B, 1, 768)
-        cross_attn_total = emb_total[:, None, :]  # (B, 1, 768)
+        # Cross-attention: concatenate T5 tokens + time embedding
+        time_token = time_emb[:, None, :]  # (1, 1, 768)
+        cross_attn = mx.concatenate([t5_tokens, time_token], axis=1)  # (1, 65, 768)
         
-        return global_cond, cross_attn_start, cross_attn_total
+        return cross_attn, global_cond

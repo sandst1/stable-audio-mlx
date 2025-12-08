@@ -191,6 +191,13 @@ class T5Stack(nn.Module):
             hidden_states, position_bias = layer(hidden_states, mask, position_bias)
             
         hidden_states = self.final_layer_norm(hidden_states)
+        
+        # Zero out padding tokens in the output (important for matching TFLite behavior)
+        if attention_mask is not None:
+            # Expand attention_mask to (B, L, 1) and multiply
+            mask_expanded = attention_mask[:, :, None].astype(mx.float32)
+            hidden_states = hidden_states * mask_expanded
+        
         return hidden_states
 
 class T5EncoderModel(nn.Module):

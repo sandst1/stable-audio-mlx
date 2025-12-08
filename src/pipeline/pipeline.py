@@ -42,8 +42,6 @@ def sample_rk4(model_fn, x, timesteps, cond_tokens, uncond_tokens, global_cond, 
     
     This is a much more accurate ODE solver than Euler, requiring 4 model 
     evaluations per step but providing 4th order accuracy.
-    
-    Reference: TFLite implementation uses this sampler for quality output.
     """
     
     def get_velocity(latents, t_value):
@@ -123,13 +121,12 @@ def sample_euler(model_fn, x, timesteps, cond_tokens, uncond_tokens, global_cond
     return x
 
 class StableAudioPipeline:
-    def __init__(self, vae, dit, t5, conditioners, tokenizer, tflite_conditioners=None):
+    def __init__(self, vae, dit, t5, conditioners, tokenizer):
         self.vae = vae
         self.dit = dit
         self.t5 = t5
         self.conditioners = conditioners
         self.tokenizer = tokenizer
-        self.tflite_conditioners = tflite_conditioners  # Optional: use TFLite for correct conditioning
         
     @classmethod
     def from_pretrained(cls, weights_path, use_tflite_conditioners=False, tflite_model_dir=None):
@@ -137,8 +134,6 @@ class StableAudioPipeline:
         
         Args:
             weights_path: Path to MLX weights NPZ file
-            use_tflite_conditioners: If True, use TFLite conditioners model (more accurate)
-            tflite_model_dir: Directory containing TFLite models (required if use_tflite_conditioners=True)
         """
         print("Loading MLX weights...")
         data = np.load(weights_path, allow_pickle=True)
@@ -158,12 +153,6 @@ class StableAudioPipeline:
         dit_weights = {k: mx.array(v) for k, v in data['dit'].item().items()}
         dit.load_weights(list(dit_weights.items()))
         dit.eval()  # Disable dropout and other training-specific layers
-        
-        # Conditioners
-        print("Initializing Conditioners...")
-        conditioners = Conditioners()
-        cond_weights = {k: v for k, v in data['cond'].item().items()}
-        conditioners.load_weights(cond_weights)
         
         # T5 - Load from local Stable Audio weights, not HuggingFace t5-base
         print("Loading T5 from Stable Audio weights...")
@@ -245,23 +234,15 @@ class StableAudioPipeline:
         # Set T5 to eval mode to disable dropout
         t5.eval()
         
-        # Optionally load TFLite conditioners for correct time conditioning
-        tflite_cond = None
-        if use_tflite_conditioners:
-            if tflite_model_dir is None:
-                tflite_model_dir = "related/tflite_model"
-            
-            print(f"Loading TFLite conditioners from {tflite_model_dir}...")
-            from src.pipeline.tflite_conditioners import TFLiteConditioners
-            tflite_cond = TFLiteConditioners(
-                model_path=f"{tflite_model_dir}/conditioners_float32.tflite",
-                tokenizer=tokenizer
-            )
-            print("✓ TFLite conditioners loaded (will use for accurate time conditioning)")
+        # Conditioners - Initialize after T5 and tokenizer are loaded
+        print("Initializing Conditioners...")
+        conditioners = Conditioners(t5, tokenizer)
+        cond_weights = {k: v for k, v in data['cond'].item().items()}
+        conditioners.load_weights(cond_weights)
              
-        return cls(vae, dit, t5, conditioners, tokenizer, tflite_conditioners=tflite_cond)
+        return cls(vae, dit, t5, conditioners, tokenizer)
 
-    def generate(self, prompt, negative_prompt="", steps=100, cfg_scale=7.0, sigma_max=1.0, seconds_start=0, seconds_total=30, seed=None, sampler="rk4"):
+    def generate(self, prompt, negative_prompt="", steps=100, cfg_scale=7.0, sigma_max=1.0, seconds_total=30, seed=None, sampler="rk4"):
         """Generate audio using rectified flow sampling.
         
         Args:
@@ -270,7 +251,6 @@ class StableAudioPipeline:
             steps: Number of sampling steps (default 100)
             cfg_scale: Classifier-free guidance scale (default 7.0)
             sigma_max: Maximum sigma/timestep (default 1.0 for rectified flow)
-            seconds_start: Start time conditioning
             seconds_total: Total duration in seconds
             seed: Random seed
             sampler: Sampling method - "rk4" (recommended, 4th order) or "euler" (1st order)
@@ -278,40 +258,15 @@ class StableAudioPipeline:
         if seed is not None:
             mx.random.seed(seed)
         
-        # 1. Get conditioning (use TFLite if available, otherwise MLX implementation)
-        if self.tflite_conditioners is not None:
-            print("Using TFLite conditioners (correct implementation)...")
-            cond_tokens, global_cond = self.tflite_conditioners(prompt, seconds_total)
-            # cond_tokens: (1, 65, 768) - already includes T5 + time token
-            # global_cond: (1, 768) - time embedding
-        else:
-            print("Encoding text...")
-            # stable-audio-open-small uses max_length=64 (not 128!)
-            tokens = self.tokenizer(prompt, return_tensors="np", padding="max_length", max_length=64, truncation=True)
-            input_ids = mx.array(tokens["input_ids"])
-            attn_mask = mx.array(tokens["attention_mask"])
-            t5_output = self.t5(input_ids, attn_mask)  # (1, 64, 768)
-            
-            # 2. Global Conditioning & Cross-attention time embeddings
-            print("Encoding global params...")
-            global_cond, cross_attn_start, cross_attn_total = self.conditioners(seconds_start, seconds_total)
-            # global_cond: (1, 768) - stable-audio-open-small uses only seconds_total
-            # cross_attn_start: (1, 1, 768)
-            # cross_attn_total: (1, 1, 768)
-            
-            # 3. Build cross-attention conditioning
-            # stable-audio-open-small only has seconds_total (not seconds_start)
-            # Concatenate along sequence dimension: T5 output + total
-            cond_tokens = mx.concatenate([t5_output, cross_attn_total], axis=1)  # (1, L+1, 768)
+        # 1. Get conditioning
+        print("Encoding text and time conditioning...")
+        cond_tokens, global_cond = self.conditioners(prompt, seconds_total)
+        # cond_tokens: (1, 65, 768) - T5 tokens (64) + time embedding (1)
+        # global_cond: (1, 768) - time embedding
         
         # Encode negative prompt for CFG
         if cfg_scale > 1.0:
-            neg_tokens = self.tokenizer(negative_prompt, return_tensors="np", padding="max_length", max_length=64, truncation=True)
-            neg_input_ids = mx.array(neg_tokens["input_ids"])
-            neg_attn_mask = mx.array(neg_tokens["attention_mask"])
-            neg_t5_output = self.t5(neg_input_ids, neg_attn_mask)  # (1, L, 768)
-            # For negative, use same time conditioning (only seconds_total for small model)
-            uncond_tokens = mx.concatenate([neg_t5_output, cross_attn_total], axis=1)
+            uncond_tokens, _ = self.conditioners(negative_prompt, seconds_total)
         else:
             uncond_tokens = None
         
@@ -359,9 +314,8 @@ class StableAudioPipeline:
         mx.eval(audio)
         
         # Note: Decoder has final_tanh=False, so output is not bounded
-        # TFLite reference does NOT clip the output, so we shouldn't either
         # The model is trained to produce output in a reasonable range
-        # audio = mx.clip(audio, -1.0, 1.0)  # REMOVED - don't clip!
+        # Don't clip the output
         mx.eval(audio)
         
         return audio
