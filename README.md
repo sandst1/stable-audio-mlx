@@ -1,103 +1,133 @@
 # Stable Audio MLX
 
-**MLX (Apple Silicon)** implementation of Stability AI's **stable-audio-open-small** model for text-to-audio generation.
+Text-to-audio generation using Stability AI's [stable-audio-open-small](https://huggingface.co/stabilityai/stable-audio-open-small) model, optimized for Apple Silicon using the MLX framework.
 
-**Status**: ✅ **WORKING!** Produces high-quality audio using hybrid TFLite+MLX approach.
+![Sampler UI](sampler.png)
 
-## ⚠️ Important Requirements
+## Features
 
-1. **macOS** with Apple Silicon (M1/M2/M3)
-2. **Python 3.10+** (Recommended: 3.11 or 3.12)  
-3. **TensorFlow** (for TFLite conditioners): `pip install tensorflow-macos`
-4. **TFLite models** in `related/tflite_model/` (included in repo)
+- **CLI Audio Generation** (`app.py`) - Generate audio from text prompts via command line
+- **Interactive Sampler UI** (`sampler.py`) - PyQt6-based keyboard sampler for real-time playback
 
-## Why Hybrid TFLite+MLX?
+## Setup
 
-Our pure MLX implementation has a bug in the time conditioning (NumberEmbedder). Using the TFLite conditioners model fixes this and produces perfect audio quality. The DiT and VAE run entirely in MLX (fast on Apple Silicon!).
+### 1. Create Virtual Environment
 
-See `BUG_FIX_SUMMARY.md` for full technical details.
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
 
-## Installation
+### 2. Install Dependencies
 
-1. Clone or navigate to this repository.
-2. Create and activate a virtual environment:
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate
-   ```
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+pip install -r requirements.txt
+```
 
-## Model Preparation
+### 3. Get Model Access
 
-The weights are converted from the PyTorch safetensors format to MLX format.
+The model requires accepting the license on Hugging Face:
 
-### Automatic Setup (Recommended)
+1. Visit [stable-audio-open-1.0](https://huggingface.co/stabilityai/stable-audio-open-1.0) and accept the license (name + email required)
+2. Visit [stable-audio-open-small](https://huggingface.co/stabilityai/stable-audio-open-small) and accept the license
 
-Simply run the conversion script - it will automatically download the model if needed:
+### 4. Login to Hugging Face
+
+```bash
+huggingface-cli login
+```
+
+Enter your Hugging Face access token when prompted.
+
+### 5. Download and Convert Model
 
 ```bash
 python src/conversion/convert.py
 ```
 
-This script will:
-- ✓ Auto-download model files from HuggingFace if not present
-- ✓ Extract and convert the VAE, DiT, Conditioners, and T5 encoder weights
-- ✓ Save converted weights to `model/stable_audio_small.npz` and `model/t5.safetensors`
-- ✓ Handle weight normalization fusion and tensor transposition for MLX compatibility
-
-The first run will download ~3GB of model files. Subsequent runs will use the cached files.
-
-### Manual Setup (Optional)
-
-If you have your own model files or want to use a different variant:
-
-1. Place your files in the `model/` folder:
-   - `model/model.safetensors` - the model weights
-   - `model/model_config.json` - model configuration (optional)
-
-2. Run the conversion script as above.
+This will:
+- Download `model.safetensors` and `model_config.json` from Hugging Face
+- Download T5 text encoder weights
+- Convert weights to MLX format (`model/stable_audio_small.npz`)
 
 ## Usage
 
-Use the `app.py` script to generate audio.
+### CLI Audio Generation
+
+Generate audio from a text prompt:
 
 ```bash
-python app.py --prompt "A beautiful orchestral symphony, classical music" --seconds 10 --output output.wav
+python app.py --prompt "warm arpeggios on house beats 120BPM with drums"
 ```
 
-### Arguments
+#### Options
 
-- `--prompt`: The text description of the audio (required).
-- `--seconds`: Duration in seconds (default: 10).
-- `--steps`: Number of diffusion steps (default: 50).
-- `--output`: Output filename (default: `output.wav`).
-- `--seed`: Random seed for reproducibility.
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--prompt` | (required) | Text description of the audio to generate |
+| `--negative-prompt` | `""` | Negative prompt for CFG guidance |
+| `--seconds` | `5.0` | Audio duration in seconds |
+| `--steps` | `8` | Inference steps (8-30 recommended) |
+| `--cfg-scale` | `6.0` | Classifier-free guidance scale |
+| `--seed` | random | Random seed for reproducibility |
+| `--sampler` | `euler` | Sampler method: `euler` (faster) or `rk4` (higher quality) |
+| `--cpu` | false | Force CPU inference |
 
-## Project Structure
+#### Examples
 
+```bash
+# Basic generation
+python app.py --prompt "ambient pad with reverb"
+
+# Longer duration with more steps
+python app.py --prompt "techno kick drum loop" --seconds 10 --steps 30
+
+# Reproducible output with seed
+python app.py --prompt "jazz piano chords" --seed 42
+
+# Higher quality with RK4 sampler
+python app.py --prompt "orchestral strings" --sampler rk4 --steps 20
 ```
-model/                          # Model files (place your weights here)
-├── model.safetensors          # Input: PyTorch weights
-├── model_config.json          # Input: Model config (optional)
-├── stable_audio_small.npz     # Output: Converted MLX weights (VAE, DiT, Conditioners)
-├── t5.safetensors            # Output: T5 encoder weights
-└── tokenizer files...         # Output: Auto-downloaded tokenizer
 
-src/
-├── conversion/
-│   └── convert.py             # Unified conversion script
-├── models/                    # Model architectures (VAE, DiT, T5)
-└── pipeline/                  # Inference pipeline
+Output files are saved as `{prompt}_seed_{seed}.wav` (44.1kHz stereo WAV).
+
+### Interactive Sampler UI
+
+Launch the keyboard sampler interface:
+
+```bash
+python sampler.py
 ```
 
-## Known Limitations
+#### Controls
 
-- **CFG**: Classifier-Free Guidance is supported but may require tuning for best results.
-- **Performance**: The DiT model is large. Ensure you have sufficient RAM (16GB+ recommended).
+1. **Set BPM** - Adjust the tempo slider (60-200 BPM)
+2. **Set Duration** - Choose audio length (2-10 seconds)
+3. **Enter Prompt** - Describe the sound you want
+4. **Click Generate** - Wait for audio generation
+5. **Play with Keyboard** - Hold keys to play, release to stop
+
+#### Keyboard Layout
+
+| Key | Note | Key | Note |
+|-----|------|-----|------|
+| `a` | C4 | `w` | C#4 |
+| `s` | D4 | `e` | D#4 |
+| `d` | E4 | | |
+| `f` | F4 | `t` | F#4 |
+| `g` | G4 | `y` | G#4 |
+| `h` | A4 | `u` | A#4 |
+| `j` | B4 | | |
+| `k` | C5 | | |
+
+Each key plays the generated audio from a different position, creating a pitch-shifted effect across the keyboard.
+
+## Requirements
+
+- macOS with Apple Silicon (M1/M2/M3)
+- Python 3.10+
+- ~4-6GB RAM for inference
 
 ## License
 
-This project adapts architecture from Stability AI's open release. Please refer to their license for model usage.
+Model weights are subject to [Stability AI's license](https://huggingface.co/stabilityai/stable-audio-open-small).
