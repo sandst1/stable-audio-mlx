@@ -18,14 +18,14 @@ source .venv/bin/activate
 
 2. **Generate audio**:
    ```bash
-   python app.py --prompt "your description" --seconds 10 --steps 30 --cfg-scale 7.0 --seed 42 --output output.wav
+   python generate.py --prompt "your description" --seconds 10 --steps 30 --cfg-scale 7.0 --seed 42 --output output.wav
    ```
 
 ## Project Structure
 
 ```
 stable-audio-mlx/
-├── app.py                      # Main CLI for audio generation
+├── generate.py                      # Main CLI for audio generation
 ├── model/                      # Model weights (auto-downloaded)
 │   ├── model.safetensors      # Original PyTorch weights
 │   ├── model_config.json      # Model configuration
@@ -150,7 +150,7 @@ The `convert.py` script:
 
 Generate test audio to verify setup:
 ```bash
-python app.py --prompt "warm arpeggios on house beats 120BPM with drums" \
+python generate.py --prompt "warm arpeggios on house beats 120BPM with drums" \
   --seconds 10 --steps 30 --cfg-scale 7.0 --seed 42 \
   --output test.wav --sampler euler
 ```

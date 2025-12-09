@@ -269,7 +269,7 @@ def convert():
         else:
             print("⚠ Could not obtain T5 weights. Text encoding may not work properly.")
     
-    print("\nConversion complete! Ready to use with app.py")
+    print("\nConversion complete! Ready to use with generate.py")
 
 if __name__ == "__main__":
     convert()

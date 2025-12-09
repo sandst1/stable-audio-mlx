@@ -6,3 +6,6 @@ model/
 related/
 
 .vscode
+
+
+*.wav

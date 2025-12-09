@@ -6,7 +6,7 @@ Text-to-audio generation using Stability AI's [stable-audio-open-small](https://
 
 ## Features
 
-- **CLI Audio Generation** (`app.py`) - Generate audio from text prompts via command line
+- **CLI Audio Generation** (`generate.py`) - Generate audio from text prompts via command line
 - **Interactive Sampler UI** (`sampler.py`) - PyQt6-based keyboard sampler for real-time playback
 
 ## Setup
@@ -57,7 +57,7 @@ This will:
 Generate audio from a text prompt:
 
 ```bash
-python app.py --prompt "warm arpeggios on house beats 120BPM with drums"
+python generate.py --prompt "warm arpeggios on house beats 120BPM with drums"
 ```
 
 #### Options
@@ -77,16 +77,16 @@ python app.py --prompt "warm arpeggios on house beats 120BPM with drums"
 
 ```bash
 # Basic generation
-python app.py --prompt "ambient pad with reverb"
+python generate.py --prompt "ambient pad with reverb"
 
 # Longer duration with more steps
-python app.py --prompt "techno kick drum loop" --seconds 10 --steps 30
+python generate.py --prompt "techno kick drum loop" --seconds 10 --steps 30
 
 # Reproducible output with seed
-python app.py --prompt "jazz piano chords" --seed 42
+python generate.py --prompt "jazz piano chords" --seed 42
 
 # Higher quality with RK4 sampler
-python app.py --prompt "orchestral strings" --sampler rk4 --steps 20
+python generate.py --prompt "orchestral strings" --sampler rk4 --steps 20
 ```
 
 Output files are saved as `{prompt}_seed_{seed}.wav` (44.1kHz stereo WAV).
