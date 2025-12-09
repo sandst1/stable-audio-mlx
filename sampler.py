@@ -8,7 +8,8 @@ Controls:
     - White keys: a=C4, s=D4, d=E4, f=F4, g=G4, h=A4, j=B4, k=C5
     - Black keys: w=C#4, e=D#4, t=F#4, y=G#4, u=A#4
     - Hold key to play (loops), release to stop
-    - Loop Start/End sliders define the playable region
+    - Drag waveform handles to set loop region start/end
+    - Drag inside the region to move the whole selection
 """
 
 import os
@@ -23,8 +24,8 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QSlider, QLabel, QPushButton,
     QLineEdit, QFrame, QProgressBar, QComboBox, QCheckBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QKeyEvent, QPainter, QColor, QFont, QPen
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRectF
+from PyQt6.QtGui import QKeyEvent, QPainter, QColor, QFont, QPen, QBrush, QLinearGradient, QMouseEvent
 
 from src.pipeline.pipeline import StableAudioPipeline
 
@@ -255,6 +256,221 @@ class AudioPlayer:
             outdata *= self.volume
 
 
+class WaveformWidget(QWidget):
+    """Waveform display with draggable loop region markers."""
+
+    # Signals
+    regionChanged = pyqtSignal(float, float)  # start, end (0.0 to 1.0)
+
+    # Handle width for dragging
+    HANDLE_WIDTH = 10
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(100)
+        self.setMinimumWidth(400)
+        self.setMouseTracking(True)
+
+        # Waveform data (downsampled for display)
+        self.waveform_peaks = None  # (num_bins, 2) - min/max per bin
+
+        # Loop region (0.0 to 1.0)
+        self.region_start = 0.0
+        self.region_end = 1.0
+
+        # Dragging state
+        self.dragging = None  # 'start', 'end', 'region', or None
+        self.drag_offset = 0.0
+        self.last_mouse_x = 0
+
+    def set_audio(self, audio_data):
+        """Set audio data and compute waveform peaks for display.
+
+        Args:
+            audio_data: numpy array of shape (samples, 2) stereo
+        """
+        if audio_data is None:
+            self.waveform_peaks = None
+            self.update()
+            return
+
+        # Mix to mono for display
+        mono = audio_data.mean(axis=1)
+
+        # Downsample to ~800 bins for display
+        num_bins = min(800, len(mono))
+        bin_size = len(mono) // num_bins
+
+        peaks = []
+        for i in range(num_bins):
+            start_idx = i * bin_size
+            end_idx = start_idx + bin_size
+            chunk = mono[start_idx:end_idx]
+            if len(chunk) > 0:
+                peaks.append((chunk.min(), chunk.max()))
+            else:
+                peaks.append((0, 0))
+
+        self.waveform_peaks = np.array(peaks)
+        self.update()
+
+    def set_region(self, start, end):
+        """Set the loop region (0.0 to 1.0)."""
+        self.region_start = max(0.0, min(1.0, start))
+        self.region_end = max(0.0, min(1.0, end))
+        if self.region_start >= self.region_end:
+            self.region_end = min(1.0, self.region_start + 0.01)
+        self.update()
+
+    def _x_to_pos(self, x):
+        """Convert x coordinate to position (0.0 to 1.0)."""
+        return max(0.0, min(1.0, x / self.width()))
+
+    def _pos_to_x(self, pos):
+        """Convert position (0.0 to 1.0) to x coordinate."""
+        return pos * self.width()
+
+    def _get_handle_at(self, x):
+        """Check if x is over a handle. Returns 'start', 'end', 'region', or None."""
+        start_x = self._pos_to_x(self.region_start)
+        end_x = self._pos_to_x(self.region_end)
+
+        # Check start handle
+        if abs(x - start_x) < self.HANDLE_WIDTH:
+            return 'start'
+        # Check end handle
+        if abs(x - end_x) < self.HANDLE_WIDTH:
+            return 'end'
+        # Check if in region (for dragging whole region)
+        if start_x < x < end_x:
+            return 'region'
+        return None
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            x = event.position().x()
+            self.dragging = self._get_handle_at(x)
+            self.last_mouse_x = x
+            if self.dragging == 'region':
+                self.drag_offset = self._x_to_pos(x) - self.region_start
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.dragging = None
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        x = event.position().x()
+
+        # Update cursor
+        handle = self._get_handle_at(x)
+        if handle in ('start', 'end'):
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif handle == 'region':
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+        # Handle dragging
+        if self.dragging:
+            pos = self._x_to_pos(x)
+
+            if self.dragging == 'start':
+                new_start = min(pos, self.region_end - 0.01)
+                self.region_start = max(0.0, new_start)
+            elif self.dragging == 'end':
+                new_end = max(pos, self.region_start + 0.01)
+                self.region_end = min(1.0, new_end)
+            elif self.dragging == 'region':
+                # Move the whole region
+                region_width = self.region_end - self.region_start
+                new_start = pos - self.drag_offset
+                new_start = max(0.0, min(1.0 - region_width, new_start))
+                self.region_start = new_start
+                self.region_end = new_start + region_width
+
+            self.update()
+            self.regionChanged.emit(self.region_start, self.region_end)
+            self.last_mouse_x = x
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        width = self.width()
+        height = self.height()
+        center_y = height / 2
+
+        # Background
+        painter.fillRect(0, 0, width, height, QColor(30, 30, 35))
+
+        # Draw dimmed region outside selection
+        dim_color = QColor(0, 0, 0, 150)
+        start_x = self._pos_to_x(self.region_start)
+        end_x = self._pos_to_x(self.region_end)
+
+        # Left dimmed region
+        if start_x > 0:
+            painter.fillRect(0, 0, int(start_x), height, dim_color)
+        # Right dimmed region
+        if end_x < width:
+            painter.fillRect(int(end_x), 0, int(width - end_x), height, dim_color)
+
+        # Draw waveform
+        if self.waveform_peaks is not None:
+            num_bins = len(self.waveform_peaks)
+            bin_width = width / num_bins
+
+            # Gradient for waveform
+            for i, (min_val, max_val) in enumerate(self.waveform_peaks):
+                x = i * bin_width
+                pos = i / num_bins
+
+                # Color based on whether in selection
+                if self.region_start <= pos <= self.region_end:
+                    color = QColor(80, 180, 255)
+                else:
+                    color = QColor(60, 100, 140)
+
+                # Draw vertical line from min to max
+                y_min = center_y - (max_val * center_y * 0.9)
+                y_max = center_y - (min_val * center_y * 0.9)
+
+                painter.setPen(QPen(color, max(1, bin_width * 0.8)))
+                painter.drawLine(int(x + bin_width/2), int(y_min),
+                               int(x + bin_width/2), int(y_max))
+        else:
+            # No waveform - draw placeholder text
+            painter.setPen(QColor(100, 100, 100))
+            painter.drawText(event.rect(), Qt.AlignmentFlag.AlignCenter,
+                           "Generate audio to see waveform")
+
+        # Draw center line
+        painter.setPen(QPen(QColor(60, 60, 70), 1))
+        painter.drawLine(0, int(center_y), width, int(center_y))
+
+        # Draw loop region handles
+        handle_color = QColor(255, 200, 80)
+
+        # Start handle
+        painter.setPen(QPen(handle_color, 2))
+        painter.drawLine(int(start_x), 0, int(start_x), height)
+        # Start handle grip
+        painter.fillRect(int(start_x - 4), 0, 8, height, QColor(handle_color.red(), handle_color.green(), handle_color.blue(), 100))
+
+        # End handle
+        painter.drawLine(int(end_x), 0, int(end_x), height)
+        # End handle grip
+        painter.fillRect(int(end_x - 4), 0, 8, height, QColor(handle_color.red(), handle_color.green(), handle_color.blue(), 100))
+
+        # Draw time labels
+        painter.setPen(QColor(150, 150, 150))
+        font = QFont()
+        font.setPointSize(9)
+        painter.setFont(font)
+        painter.drawText(5, height - 5, f"{self.region_start*100:.0f}%")
+        painter.drawText(width - 35, height - 5, f"{self.region_end*100:.0f}%")
+
+
 class KeyboardWidget(QWidget):
     """Visual piano keyboard widget."""
 
@@ -433,29 +649,13 @@ class SamplerWindow(QMainWindow):
         volume_layout.addWidget(self.volume_value_label)
         layout.addLayout(volume_layout)
 
-        # Loop region sliders (Start / End)
-        loop_layout = QHBoxLayout()
-        loop_label = QLabel("Loop:")
-        self.loop_start_slider = QSlider(Qt.Orientation.Horizontal)
-        self.loop_start_slider.setMinimum(0)
-        self.loop_start_slider.setMaximum(100)
-        self.loop_start_slider.setValue(0)
-        self.loop_start_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.loop_start_slider.valueChanged.connect(self._on_loop_region_changed)
-        self.loop_end_slider = QSlider(Qt.Orientation.Horizontal)
-        self.loop_end_slider.setMinimum(0)
-        self.loop_end_slider.setMaximum(100)
-        self.loop_end_slider.setValue(100)
-        self.loop_end_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.loop_end_slider.valueChanged.connect(self._on_loop_region_changed)
-        self.loop_value_label = QLabel("0% - 100%")
-        loop_layout.addWidget(loop_label)
-        loop_layout.addWidget(QLabel("Start:"))
-        loop_layout.addWidget(self.loop_start_slider, 1)
-        loop_layout.addWidget(QLabel("End:"))
-        loop_layout.addWidget(self.loop_end_slider, 1)
-        loop_layout.addWidget(self.loop_value_label)
-        layout.addLayout(loop_layout)
+        # Waveform display with loop region
+        waveform_label = QLabel("Loop Region (drag handles to adjust):")
+        waveform_label.setStyleSheet("color: gray; font-size: 11px;")
+        layout.addWidget(waveform_label)
+        self.waveform_widget = WaveformWidget()
+        self.waveform_widget.regionChanged.connect(self._on_waveform_region_changed)
+        layout.addWidget(self.waveform_widget)
 
         # Prompt input row
         prompt_layout = QHBoxLayout()
@@ -585,6 +785,11 @@ class SamplerWindow(QMainWindow):
     def _on_generation_finished(self, audio_array):
         """Called when generation is complete."""
         self.audio_player.load_audio(audio_array)
+        # Update waveform display
+        self.waveform_widget.set_audio(audio_array.T)  # Convert (2, T) to (T, 2)
+        # Reset loop region to full sample
+        self.waveform_widget.set_region(0.0, 1.0)
+        self.audio_player.set_region(0.0, 1.0)
         self.active_sound_label.setText(f"Active Sound: {self.current_prompt}")
         self.status_label.setText("Ready - Use keyboard to play")
         self.generate_btn.setEnabled(True)
@@ -611,20 +816,9 @@ class SamplerWindow(QMainWindow):
         self.bpm_slider.setEnabled(checked)
         self.bpm_value_label.setEnabled(checked)
 
-    def _on_loop_region_changed(self):
-        """Handle loop region slider changes."""
-        start = self.loop_start_slider.value()
-        end = self.loop_end_slider.value()
-        # Ensure start < end
-        if start >= end:
-            if self.sender() == self.loop_start_slider:
-                end = min(100, start + 1)
-                self.loop_end_slider.setValue(end)
-            else:
-                start = max(0, end - 1)
-                self.loop_start_slider.setValue(start)
-        self.loop_value_label.setText(f"{start}% - {end}%")
-        self.audio_player.set_region(start / 100.0, end / 100.0)
+    def _on_waveform_region_changed(self, start, end):
+        """Handle waveform region changes from dragging."""
+        self.audio_player.set_region(start, end)
 
     def keyPressEvent(self, event: QKeyEvent):
         """Handle key press for playing notes."""
