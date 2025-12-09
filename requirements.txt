@@ -26,3 +26,5 @@ tqdm==4.67.1
 transformers==4.57.3
 typing_extensions==4.15.0
 urllib3==2.6.0
+PyQt6>=6.5.0
+sounddevice>=0.4.6
