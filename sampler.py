@@ -8,6 +8,7 @@ Controls:
     - White keys: a=C4, s=D4, d=E4, f=F4, g=G4, h=A4, j=B4, k=C5
     - Black keys: w=C#4, e=D#4, t=F#4, y=G#4, u=A#4
     - Hold key to play (loops), release to stop
+    - Loop Start/End sliders define the playable region
 """
 
 import os
@@ -83,6 +84,9 @@ class AudioPlayer:
         self.sample_rate = sample_rate
         self.current_position = 0.0  # Float for pitch mode interpolation
         self.loop_start = 0
+        self.loop_end = 0  # 0 means end of audio
+        self.region_start = 0.0  # Start of playable region (0.0 to 1.0)
+        self.region_end = 1.0    # End of playable region (0.0 to 1.0)
         self.is_playing = False
         self.is_fading_in = False
         self.is_fading_out = False
@@ -102,22 +106,37 @@ class AudioPlayer:
         # Ensure stream is created
         self._ensure_stream()
 
+    def set_region(self, start, end):
+        """Set the playable region (0.0 to 1.0)."""
+        self.region_start = max(0.0, min(1.0, start))
+        self.region_end = max(0.0, min(1.0, end))
+        # Ensure start < end
+        if self.region_start >= self.region_end:
+            self.region_end = min(1.0, self.region_start + 0.01)
+
     def play_from(self, note_index):
         """Start playback based on note (0-12) and current mode."""
         if self.audio_data is None:
             return
 
+        total_samples = len(self.audio_data)
+        # Calculate region boundaries in samples
+        region_start_sample = int(self.region_start * total_samples)
+        region_end_sample = int(self.region_end * total_samples)
+        region_length = region_end_sample - region_start_sample
+
         if self.mode == self.MODE_POSITION:
-            # Position mode: start from different positions in the sample
-            total_samples = len(self.audio_data)
-            self.loop_start = int((note_index / 12) * total_samples)
+            # Position mode: start from different positions within the region
+            self.loop_start = region_start_sample + int((note_index / 12) * region_length)
+            self.loop_end = region_end_sample
             self.current_position = float(self.loop_start)
             self.playback_rate = 1.0
         else:
-            # Pitch mode: start from beginning, adjust playback rate
+            # Pitch mode: start from region start, adjust playback rate
             # note_index 0 = C4 (original pitch), each semitone up = 2^(1/12) faster
-            self.loop_start = 0
-            self.current_position = 0.0
+            self.loop_start = region_start_sample
+            self.loop_end = region_end_sample
+            self.current_position = float(self.loop_start)
             self.playback_rate = 2.0 ** (note_index / 12.0)
 
         # Start fade-in, cancel any afterplay/fade-out in progress
@@ -161,6 +180,8 @@ class AudioPlayer:
             return
 
         total_samples = len(self.audio_data)
+        # Use loop_end if set, otherwise end of audio
+        effective_end = self.loop_end if self.loop_end > 0 else total_samples
 
         if self.playback_rate == 1.0:
             # Normal playback (position mode or pitch mode at original pitch)
@@ -168,13 +189,13 @@ class AudioPlayer:
             int_pos = int(self.current_position)
             while filled < frames:
                 end_pos = int_pos + (frames - filled)
-                if end_pos >= total_samples:
+                if end_pos >= effective_end:
                     # Copy remaining samples before loop
-                    remaining = total_samples - int_pos
+                    remaining = effective_end - int_pos
                     if remaining > 0:
-                        outdata[filled:filled + remaining] = self.audio_data[int_pos:]
+                        outdata[filled:filled + remaining] = self.audio_data[int_pos:int_pos + remaining]
                         filled += remaining
-                    # Loop back
+                    # Loop back to loop_start
                     int_pos = self.loop_start
                 else:
                     chunk = frames - filled
@@ -188,15 +209,15 @@ class AudioPlayer:
                 int_pos = int(self.current_position)
                 frac = self.current_position - int_pos
 
-                if int_pos >= total_samples - 1:
-                    # Loop back
+                if int_pos >= effective_end - 1:
+                    # Loop back to loop_start
                     self.current_position = float(self.loop_start)
                     int_pos = self.loop_start
                     frac = 0.0
 
                 # Linear interpolation between samples
                 sample0 = self.audio_data[int_pos]
-                sample1 = self.audio_data[min(int_pos + 1, total_samples - 1)]
+                sample1 = self.audio_data[min(int_pos + 1, effective_end - 1)]
                 outdata[i] = sample0 + frac * (sample1 - sample0)
 
                 self.current_position += self.playback_rate
@@ -386,7 +407,7 @@ class SamplerWindow(QMainWindow):
         duration_layout = QHBoxLayout()
         duration_label = QLabel("Duration:")
         self.duration_slider = QSlider(Qt.Orientation.Horizontal)
-        self.duration_slider.setMinimum(2)
+        self.duration_slider.setMinimum(4)
         self.duration_slider.setMaximum(10)
         self.duration_slider.setValue(5)
         self.duration_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -411,6 +432,30 @@ class SamplerWindow(QMainWindow):
         volume_layout.addWidget(self.volume_slider, 1)
         volume_layout.addWidget(self.volume_value_label)
         layout.addLayout(volume_layout)
+
+        # Loop region sliders (Start / End)
+        loop_layout = QHBoxLayout()
+        loop_label = QLabel("Loop:")
+        self.loop_start_slider = QSlider(Qt.Orientation.Horizontal)
+        self.loop_start_slider.setMinimum(0)
+        self.loop_start_slider.setMaximum(100)
+        self.loop_start_slider.setValue(0)
+        self.loop_start_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.loop_start_slider.valueChanged.connect(self._on_loop_region_changed)
+        self.loop_end_slider = QSlider(Qt.Orientation.Horizontal)
+        self.loop_end_slider.setMinimum(0)
+        self.loop_end_slider.setMaximum(100)
+        self.loop_end_slider.setValue(100)
+        self.loop_end_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.loop_end_slider.valueChanged.connect(self._on_loop_region_changed)
+        self.loop_value_label = QLabel("0% - 100%")
+        loop_layout.addWidget(loop_label)
+        loop_layout.addWidget(QLabel("Start:"))
+        loop_layout.addWidget(self.loop_start_slider, 1)
+        loop_layout.addWidget(QLabel("End:"))
+        loop_layout.addWidget(self.loop_end_slider, 1)
+        loop_layout.addWidget(self.loop_value_label)
+        layout.addLayout(loop_layout)
 
         # Prompt input row
         prompt_layout = QHBoxLayout()
@@ -565,6 +610,21 @@ class SamplerWindow(QMainWindow):
         """Handle BPM checkbox toggle."""
         self.bpm_slider.setEnabled(checked)
         self.bpm_value_label.setEnabled(checked)
+
+    def _on_loop_region_changed(self):
+        """Handle loop region slider changes."""
+        start = self.loop_start_slider.value()
+        end = self.loop_end_slider.value()
+        # Ensure start < end
+        if start >= end:
+            if self.sender() == self.loop_start_slider:
+                end = min(100, start + 1)
+                self.loop_end_slider.setValue(end)
+            else:
+                start = max(0, end - 1)
+                self.loop_start_slider.setValue(start)
+        self.loop_value_label.setText(f"{start}% - {end}%")
+        self.audio_player.set_region(start / 100.0, end / 100.0)
 
     def keyPressEvent(self, event: QKeyEvent):
         """Handle key press for playing notes."""
