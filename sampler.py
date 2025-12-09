@@ -20,7 +20,7 @@ import mlx.core as mx
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QSlider, QLabel, QPushButton,
-    QLineEdit, QFrame, QProgressBar
+    QLineEdit, QFrame, QProgressBar, QComboBox, QCheckBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QKeyEvent, QPainter, QColor, QFont, QPen
@@ -71,17 +71,26 @@ class AudioPlayer:
 
     # Fade duration in samples (~5ms at 44100Hz - very short to avoid clicks)
     FADE_SAMPLES = 220
+    # Afterplay duration in samples (~200ms at 44100Hz)
+    AFTERPLAY_SAMPLES = 8820
+
+    # Keyboard modes
+    MODE_POSITION = 0  # Start from different positions in the sample
+    MODE_PITCH = 1     # Pitch shift (resample) from beginning
 
     def __init__(self, sample_rate=44100):
         self.audio_data = None  # (samples, 2) stereo
         self.sample_rate = sample_rate
-        self.current_position = 0
+        self.current_position = 0.0  # Float for pitch mode interpolation
         self.loop_start = 0
         self.is_playing = False
         self.is_fading_in = False
         self.is_fading_out = False
         self.fade_position = 0
         self.stream = None
+        self.mode = self.MODE_POSITION
+        self.playback_rate = 1.0  # For pitch mode: 1.0 = original, 2.0 = octave up
+        self.volume = 1.0  # Master volume (0.0 to 1.0)
 
     def load_audio(self, audio_array):
         """Load audio from pipeline output (2, T) -> (T, 2)."""
@@ -94,23 +103,34 @@ class AudioPlayer:
         self._ensure_stream()
 
     def play_from(self, note_index):
-        """Start playback from position based on note (0-12)."""
+        """Start playback based on note (0-12) and current mode."""
         if self.audio_data is None:
             return
-        # Calculate start position based on note
-        total_samples = len(self.audio_data)
-        self.loop_start = int((note_index / 12) * total_samples)
-        self.current_position = self.loop_start
-        # Start fade-in
+
+        if self.mode == self.MODE_POSITION:
+            # Position mode: start from different positions in the sample
+            total_samples = len(self.audio_data)
+            self.loop_start = int((note_index / 12) * total_samples)
+            self.current_position = float(self.loop_start)
+            self.playback_rate = 1.0
+        else:
+            # Pitch mode: start from beginning, adjust playback rate
+            # note_index 0 = C4 (original pitch), each semitone up = 2^(1/12) faster
+            self.loop_start = 0
+            self.current_position = 0.0
+            self.playback_rate = 2.0 ** (note_index / 12.0)
+
+        # Start fade-in, cancel any afterplay/fade-out in progress
         self.is_fading_in = True
         self.is_fading_out = False
+        self.is_afterplaying = False
         self.fade_position = 0
         self.is_playing = True
 
     def stop(self):
         """Stop playback with fade-out."""
         if self.is_playing and not self.is_fading_out:
-            # Start fade-out instead of abrupt stop
+            # Start fade-out
             self.is_fading_out = True
             self.is_fading_in = False
             self.fade_position = 0
@@ -142,23 +162,44 @@ class AudioPlayer:
 
         total_samples = len(self.audio_data)
 
-        # Fill buffer with audio data (handling looping)
-        filled = 0
-        while filled < frames:
-            end_pos = self.current_position + (frames - filled)
-            if end_pos >= total_samples:
-                # Copy remaining samples before loop
-                remaining = total_samples - self.current_position
-                if remaining > 0:
-                    outdata[filled:filled + remaining] = self.audio_data[self.current_position:]
-                    filled += remaining
-                # Loop back
-                self.current_position = self.loop_start
-            else:
-                chunk = frames - filled
-                outdata[filled:filled + chunk] = self.audio_data[self.current_position:self.current_position + chunk]
-                self.current_position += chunk
-                filled += chunk
+        if self.playback_rate == 1.0:
+            # Normal playback (position mode or pitch mode at original pitch)
+            filled = 0
+            int_pos = int(self.current_position)
+            while filled < frames:
+                end_pos = int_pos + (frames - filled)
+                if end_pos >= total_samples:
+                    # Copy remaining samples before loop
+                    remaining = total_samples - int_pos
+                    if remaining > 0:
+                        outdata[filled:filled + remaining] = self.audio_data[int_pos:]
+                        filled += remaining
+                    # Loop back
+                    int_pos = self.loop_start
+                else:
+                    chunk = frames - filled
+                    outdata[filled:filled + chunk] = self.audio_data[int_pos:int_pos + chunk]
+                    int_pos += chunk
+                    filled += chunk
+            self.current_position = float(int_pos)
+        else:
+            # Pitch-shifted playback with linear interpolation
+            for i in range(frames):
+                int_pos = int(self.current_position)
+                frac = self.current_position - int_pos
+
+                if int_pos >= total_samples - 1:
+                    # Loop back
+                    self.current_position = float(self.loop_start)
+                    int_pos = self.loop_start
+                    frac = 0.0
+
+                # Linear interpolation between samples
+                sample0 = self.audio_data[int_pos]
+                sample1 = self.audio_data[min(int_pos + 1, total_samples - 1)]
+                outdata[i] = sample0 + frac * (sample1 - sample0)
+
+                self.current_position += self.playback_rate
 
         # Apply fade-in envelope
         if self.is_fading_in:
@@ -188,6 +229,10 @@ class AudioPlayer:
                     self.is_fading_out = False
                     break
 
+        # Apply master volume
+        if self.volume < 1.0:
+            outdata *= self.volume
+
 
 class KeyboardWidget(QWidget):
     """Visual piano keyboard widget."""
@@ -196,6 +241,7 @@ class KeyboardWidget(QWidget):
         super().__init__(parent)
         self.setMinimumHeight(192)
         self.setMinimumWidth(400)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # Accept keyboard focus
         self.active_notes = set()  # Set of active note indices
 
         # Key labels
@@ -318,16 +364,20 @@ class SamplerWindow(QMainWindow):
         layout.setSpacing(15)
         layout.setContentsMargins(20, 20, 20, 20)
 
-        # BPM slider row
+        # BPM slider row with checkbox
         bpm_layout = QHBoxLayout()
-        bpm_label = QLabel("BPM:")
+        self.bpm_checkbox = QCheckBox("BPM:")
+        self.bpm_checkbox.setChecked(True)
+        self.bpm_checkbox.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.bpm_checkbox.toggled.connect(self._on_bpm_toggled)
         self.bpm_slider = QSlider(Qt.Orientation.Horizontal)
         self.bpm_slider.setMinimum(60)
         self.bpm_slider.setMaximum(200)
         self.bpm_slider.setValue(120)
+        self.bpm_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.bpm_value_label = QLabel("120")
         self.bpm_slider.valueChanged.connect(lambda v: self.bpm_value_label.setText(str(v)))
-        bpm_layout.addWidget(bpm_label)
+        bpm_layout.addWidget(self.bpm_checkbox)
         bpm_layout.addWidget(self.bpm_slider, 1)
         bpm_layout.addWidget(self.bpm_value_label)
         layout.addLayout(bpm_layout)
@@ -339,12 +389,28 @@ class SamplerWindow(QMainWindow):
         self.duration_slider.setMinimum(2)
         self.duration_slider.setMaximum(10)
         self.duration_slider.setValue(5)
+        self.duration_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.duration_value_label = QLabel("5s")
         self.duration_slider.valueChanged.connect(lambda v: self.duration_value_label.setText(f"{v}s"))
         duration_layout.addWidget(duration_label)
         duration_layout.addWidget(self.duration_slider, 1)
         duration_layout.addWidget(self.duration_value_label)
         layout.addLayout(duration_layout)
+
+        # Volume slider row
+        volume_layout = QHBoxLayout()
+        volume_label = QLabel("Volume:")
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setMinimum(0)
+        self.volume_slider.setMaximum(100)
+        self.volume_slider.setValue(100)
+        self.volume_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.volume_value_label = QLabel("100%")
+        self.volume_slider.valueChanged.connect(self._on_volume_changed)
+        volume_layout.addWidget(volume_label)
+        volume_layout.addWidget(self.volume_slider, 1)
+        volume_layout.addWidget(self.volume_value_label)
+        layout.addLayout(volume_layout)
 
         # Prompt input row
         prompt_layout = QHBoxLayout()
@@ -356,12 +422,25 @@ class SamplerWindow(QMainWindow):
         prompt_layout.addWidget(self.prompt_input, 1)
         layout.addLayout(prompt_layout)
 
+        # Keyboard mode selector
+        mode_layout = QHBoxLayout()
+        mode_label = QLabel("Keyboard Mode:")
+        self.mode_selector = QComboBox()
+        self.mode_selector.addItem("Position (start from different parts)")
+        self.mode_selector.addItem("Pitch (chromatic pitch shift)")
+        self.mode_selector.currentIndexChanged.connect(self._on_mode_changed)
+        self.mode_selector.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Prevent stealing keyboard focus
+        mode_layout.addWidget(mode_label)
+        mode_layout.addWidget(self.mode_selector, 1)
+        layout.addLayout(mode_layout)
+
         # Generate button
         button_layout = QHBoxLayout()
         button_layout.addStretch()
         self.generate_btn = QPushButton("Generate")
         self.generate_btn.setMinimumWidth(120)
         self.generate_btn.clicked.connect(self._on_generate)
+        self.generate_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         button_layout.addWidget(self.generate_btn)
         layout.addLayout(button_layout)
 
@@ -429,9 +508,12 @@ class SamplerWindow(QMainWindow):
             self.status_label.setText("Please enter a prompt")
             return
 
-        # Build final prompt with BPM
-        bpm = self.bpm_slider.value()
-        full_prompt = f"{bpm}BPM {prompt_text}"
+        # Build final prompt, optionally with BPM
+        if self.bpm_checkbox.isChecked():
+            bpm = self.bpm_slider.value()
+            full_prompt = f"{bpm}BPM {prompt_text}"
+        else:
+            full_prompt = prompt_text
         self.current_prompt = prompt_text
 
         # Get duration
@@ -462,12 +544,27 @@ class SamplerWindow(QMainWindow):
         self.status_label.setText("Ready - Use keyboard to play")
         self.generate_btn.setEnabled(True)
         self.prompt_input.setEnabled(True)
+        self.keyboard_widget.setFocus()  # Focus keyboard for immediate playing
 
     def _on_generation_error(self, error_msg):
         """Called when generation fails."""
         self.status_label.setText(f"Error: {error_msg}")
         self.generate_btn.setEnabled(True)
         self.prompt_input.setEnabled(True)
+
+    def _on_mode_changed(self, index):
+        """Handle keyboard mode change."""
+        self.audio_player.mode = index
+
+    def _on_volume_changed(self, value):
+        """Handle volume slider change."""
+        self.volume_value_label.setText(f"{value}%")
+        self.audio_player.volume = value / 100.0
+
+    def _on_bpm_toggled(self, checked):
+        """Handle BPM checkbox toggle."""
+        self.bpm_slider.setEnabled(checked)
+        self.bpm_value_label.setEnabled(checked)
 
     def keyPressEvent(self, event: QKeyEvent):
         """Handle key press for playing notes."""
