@@ -129,7 +129,7 @@ class StableAudioPipeline:
         self.tokenizer = tokenizer
         
     @classmethod
-    def from_pretrained(cls, weights_path, use_tflite_conditioners=False, tflite_model_dir=None):
+    def from_pretrained(cls, weights_path):
         """Load pipeline from weights.
         
         Args:
