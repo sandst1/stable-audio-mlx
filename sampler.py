@@ -28,10 +28,42 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRectF
 from PyQt6.QtGui import QKeyEvent, QPainter, QColor, QFont, QPen, QBrush, QLinearGradient, QMouseEvent
 
 from src.pipeline.pipeline import StableAudioPipeline
+import mido
 
 
 # Note names for display
 NOTE_NAMES = ['C4', 'C#4', 'D4', 'D#4', 'E4', 'F4', 'F#4', 'G4', 'G#4', 'A4', 'A#4', 'B4', 'C5']
+
+
+class MidiInputThread(QThread):
+    """Thread for listening to MIDI input events."""
+    note_on = pyqtSignal(int, int)   # note_number, velocity
+    note_off = pyqtSignal(int)        # note_number
+
+    def __init__(self, port_name):
+        super().__init__()
+        self.port_name = port_name
+        self._running = True
+
+    def run(self):
+        try:
+            with mido.open_input(self.port_name) as port:
+                while self._running:
+                    for msg in port.iter_pending():
+                        if msg.type == 'note_on':
+                            if msg.velocity > 0:
+                                self.note_on.emit(msg.note, msg.velocity)
+                            else:
+                                # note_on with velocity 0 is equivalent to note_off
+                                self.note_off.emit(msg.note)
+                        elif msg.type == 'note_off':
+                            self.note_off.emit(msg.note)
+                    self.msleep(1)  # Small sleep to prevent busy-waiting
+        except Exception as e:
+            print(f"MIDI error: {e}")
+
+    def stop(self):
+        self._running = False
 
 
 class GenerationThread(QThread):
@@ -564,14 +596,16 @@ class SamplerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Stable Audio MLX Sampler")
-        self.setMinimumSize(500, 400)
+        self.setMinimumSize(550, 750)
 
         # State
         self.pipeline = None
         self.audio_player = AudioPlayer()
         self.active_keys = set()
+        self.active_midi_notes = set()  # Track active MIDI notes
         self.generation_thread = None
         self.current_prompt = ""
+        self.midi_thread = None
 
         # Key mapping: keyboard key -> note index (0-12)
         self.key_to_note = {
@@ -678,6 +712,21 @@ class SamplerWindow(QMainWindow):
         mode_layout.addWidget(mode_label)
         mode_layout.addWidget(self.mode_selector, 1)
         layout.addLayout(mode_layout)
+
+        # MIDI input selector
+        midi_layout = QHBoxLayout()
+        midi_label = QLabel("MIDI Input:")
+        self.midi_selector = QComboBox()
+        self.midi_selector.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.midi_selector.currentIndexChanged.connect(self._on_midi_device_changed)
+        self.midi_refresh_btn = QPushButton("Refresh")
+        self.midi_refresh_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.midi_refresh_btn.clicked.connect(self._refresh_midi_devices)
+        midi_layout.addWidget(midi_label)
+        midi_layout.addWidget(self.midi_selector, 1)
+        midi_layout.addWidget(self.midi_refresh_btn)
+        layout.addLayout(midi_layout)
+        self._refresh_midi_devices()
 
         # Generate button
         button_layout = QHBoxLayout()
@@ -820,6 +869,65 @@ class SamplerWindow(QMainWindow):
         """Handle waveform region changes from dragging."""
         self.audio_player.set_region(start, end)
 
+    def _refresh_midi_devices(self):
+        """Refresh the list of available MIDI input devices."""
+        current = self.midi_selector.currentText()
+        self.midi_selector.blockSignals(True)
+        self.midi_selector.clear()
+        self.midi_selector.addItem("None (keyboard only)")
+        for port_name in mido.get_input_names():
+            self.midi_selector.addItem(port_name)
+        # Restore selection if still available
+        idx = self.midi_selector.findText(current)
+        if idx >= 0:
+            self.midi_selector.setCurrentIndex(idx)
+        self.midi_selector.blockSignals(False)
+
+    def _on_midi_device_changed(self, index):
+        """Handle MIDI device selection change."""
+        # Stop existing MIDI thread
+        if self.midi_thread is not None:
+            self.midi_thread.stop()
+            self.midi_thread.wait()
+            self.midi_thread = None
+
+        if index > 0:  # Not "None (keyboard only)"
+            port_name = self.midi_selector.currentText()
+            self.midi_thread = MidiInputThread(port_name)
+            self.midi_thread.note_on.connect(self._on_midi_note_on)
+            self.midi_thread.note_off.connect(self._on_midi_note_off)
+            self.midi_thread.start()
+            self.status_label.setText(f"MIDI: {port_name}")
+
+    def _on_midi_note_on(self, midi_note, velocity):
+        """Handle MIDI note on event."""
+        if self.audio_player.audio_data is None:
+            return
+        # Map MIDI note to note index (C4 = 60 -> index 0)
+        note_index = midi_note - 60
+        if 0 <= note_index <= 12:
+            self.active_midi_notes.add(midi_note)
+            self.audio_player.play_from(note_index)
+            self.status_label.setText(f"Playing: {NOTE_NAMES[note_index]}")
+            # Update keyboard visualization
+            active_notes = {self.key_to_note[k] for k in self.active_keys}
+            active_notes.update(n - 60 for n in self.active_midi_notes if 0 <= n - 60 <= 12)
+            self.keyboard_widget.set_active_notes(active_notes)
+
+    def _on_midi_note_off(self, midi_note):
+        """Handle MIDI note off event."""
+        note_index = midi_note - 60
+        if midi_note in self.active_midi_notes:
+            self.active_midi_notes.discard(midi_note)
+            # Only stop if no keys or MIDI notes are active
+            if not self.active_keys and not self.active_midi_notes:
+                self.audio_player.stop()
+                self.status_label.setText("Ready")
+            # Update keyboard visualization
+            active_notes = {self.key_to_note[k] for k in self.active_keys}
+            active_notes.update(n - 60 for n in self.active_midi_notes if 0 <= n - 60 <= 12)
+            self.keyboard_widget.set_active_notes(active_notes)
+
     def keyPressEvent(self, event: QKeyEvent):
         """Handle key press for playing notes."""
         if event.isAutoRepeat():
@@ -852,6 +960,9 @@ class SamplerWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Clean up on close."""
+        if self.midi_thread is not None:
+            self.midi_thread.stop()
+            self.midi_thread.wait()
         self.audio_player.cleanup()
         event.accept()
 

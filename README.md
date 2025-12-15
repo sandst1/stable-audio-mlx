@@ -120,7 +120,14 @@ python sampler.py
 | `j` | B4 | | |
 | `k` | C5 | | |
 
-Each key plays the generated audio from a different position, creating a pitch-shifted effect across the keyboard.
+#### MIDI Input
+
+Connect a MIDI keyboard and select it from the **MIDI Input** dropdown. Notes C4-C5 (MIDI notes 60-72) map to the same notes as the computer keyboard. Click **Refresh** to rescan for newly connected devices.
+
+#### Keyboard Modes
+
+- **Position Mode** - Each key plays from a different position in the sample
+- **Pitch Mode** - Each key plays from the start with chromatic pitch shifting
 
 ## Requirements
 
