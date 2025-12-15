@@ -100,13 +100,29 @@ class GenerationThread(QThread):
             self.error.emit(str(e))
 
 
+class Voice:
+    """Represents a single polyphonic voice for audio playback."""
+
+    def __init__(self, note_index, loop_start, loop_end, playback_rate=1.0):
+        self.note_index = note_index
+        self.current_position = float(loop_start)
+        self.loop_start = loop_start
+        self.loop_end = loop_end
+        self.playback_rate = playback_rate
+        self.is_active = True
+        self.is_fading_in = True
+        self.is_fading_out = False
+        self.fade_position = 0
+
+
 class AudioPlayer:
-    """Handles real-time audio playback with looping from different start positions."""
+    """Handles real-time polyphonic audio playback with looping."""
 
     # Fade duration in samples (~5ms at 44100Hz - very short to avoid clicks)
     FADE_SAMPLES = 220
-    # Afterplay duration in samples (~200ms at 44100Hz)
-    AFTERPLAY_SAMPLES = 8820
+
+    # Maximum number of simultaneous voices
+    MAX_VOICES = 13  # One for each note in the octave
 
     # Keyboard modes
     MODE_POSITION = 0  # Start from different positions in the sample
@@ -115,19 +131,14 @@ class AudioPlayer:
     def __init__(self, sample_rate=44100):
         self.audio_data = None  # (samples, 2) stereo
         self.sample_rate = sample_rate
-        self.current_position = 0.0  # Float for pitch mode interpolation
-        self.loop_start = 0
-        self.loop_end = 0  # 0 means end of audio
         self.region_start = 0.0  # Start of playable region (0.0 to 1.0)
         self.region_end = 1.0    # End of playable region (0.0 to 1.0)
-        self.is_playing = False
-        self.is_fading_in = False
-        self.is_fading_out = False
-        self.fade_position = 0
         self.stream = None
         self.mode = self.MODE_POSITION
-        self.playback_rate = 1.0  # For pitch mode: 1.0 = original, 2.0 = octave up
         self.volume = 1.0  # Master volume (0.0 to 1.0)
+
+        # Polyphonic voice management
+        self.voices = {}  # note_index -> Voice
 
     def load_audio(self, audio_array):
         """Load audio from pipeline output (2, T) -> (T, 2)."""
@@ -148,7 +159,7 @@ class AudioPlayer:
             self.region_end = min(1.0, self.region_start + 0.01)
 
     def play_from(self, note_index):
-        """Start playback based on note (0-12) and current mode."""
+        """Start playback for a note (0-12) based on current mode. Polyphonic."""
         if self.audio_data is None:
             return
 
@@ -160,32 +171,37 @@ class AudioPlayer:
 
         if self.mode == self.MODE_POSITION:
             # Position mode: start from different positions within the region
-            self.loop_start = region_start_sample + int((note_index / 12) * region_length)
-            self.loop_end = region_end_sample
-            self.current_position = float(self.loop_start)
-            self.playback_rate = 1.0
+            loop_start = region_start_sample + int((note_index / 12) * region_length)
+            loop_end = region_end_sample
+            playback_rate = 1.0
         else:
             # Pitch mode: start from region start, adjust playback rate
             # note_index 0 = C4 (original pitch), each semitone up = 2^(1/12) faster
-            self.loop_start = region_start_sample
-            self.loop_end = region_end_sample
-            self.current_position = float(self.loop_start)
-            self.playback_rate = 2.0 ** (note_index / 12.0)
+            loop_start = region_start_sample
+            loop_end = region_end_sample
+            playback_rate = 2.0 ** (note_index / 12.0)
 
-        # Start fade-in, cancel any afterplay/fade-out in progress
-        self.is_fading_in = True
-        self.is_fading_out = False
-        self.is_afterplaying = False
-        self.fade_position = 0
-        self.is_playing = True
+        # If this note already has an active voice, restart it
+        # Otherwise create a new voice
+        voice = Voice(note_index, loop_start, loop_end, playback_rate)
+        self.voices[note_index] = voice
+
+    def stop_note(self, note_index):
+        """Stop a specific note with fade-out."""
+        if note_index in self.voices:
+            voice = self.voices[note_index]
+            if voice.is_active and not voice.is_fading_out:
+                voice.is_fading_out = True
+                voice.is_fading_in = False
+                voice.fade_position = 0
 
     def stop(self):
-        """Stop playback with fade-out."""
-        if self.is_playing and not self.is_fading_out:
-            # Start fade-out
-            self.is_fading_out = True
-            self.is_fading_in = False
-            self.fade_position = 0
+        """Stop all voices with fade-out."""
+        for voice in self.voices.values():
+            if voice.is_active and not voice.is_fading_out:
+                voice.is_fading_out = True
+                voice.is_fading_in = False
+                voice.fade_position = 0
 
     def cleanup(self):
         """Clean up the audio stream."""
@@ -207,85 +223,106 @@ class AudioPlayer:
             self.stream.start()
 
     def _audio_callback(self, outdata, frames, time, status):
-        """Called by sounddevice to fill audio buffer."""
-        if not self.is_playing or self.audio_data is None:
-            outdata.fill(0)
+        """Called by sounddevice to fill audio buffer. Mixes all active voices."""
+        # Start with silence
+        outdata.fill(0)
+
+        if self.audio_data is None or not self.voices:
             return
 
         total_samples = len(self.audio_data)
-        # Use loop_end if set, otherwise end of audio
-        effective_end = self.loop_end if self.loop_end > 0 else total_samples
 
-        if self.playback_rate == 1.0:
-            # Normal playback (position mode or pitch mode at original pitch)
-            filled = 0
-            int_pos = int(self.current_position)
-            while filled < frames:
-                end_pos = int_pos + (frames - filled)
-                if end_pos >= effective_end:
-                    # Copy remaining samples before loop
-                    remaining = effective_end - int_pos
-                    if remaining > 0:
-                        outdata[filled:filled + remaining] = self.audio_data[int_pos:int_pos + remaining]
-                        filled += remaining
-                    # Loop back to loop_start
-                    int_pos = self.loop_start
-                else:
-                    chunk = frames - filled
-                    outdata[filled:filled + chunk] = self.audio_data[int_pos:int_pos + chunk]
-                    int_pos += chunk
-                    filled += chunk
-            self.current_position = float(int_pos)
-        else:
-            # Pitch-shifted playback with linear interpolation
-            for i in range(frames):
-                int_pos = int(self.current_position)
-                frac = self.current_position - int_pos
+        # Track voices to remove after processing
+        voices_to_remove = []
 
-                if int_pos >= effective_end - 1:
-                    # Loop back to loop_start
-                    self.current_position = float(self.loop_start)
-                    int_pos = self.loop_start
-                    frac = 0.0
+        # Process each active voice
+        for note_index, voice in list(self.voices.items()):
+            if not voice.is_active:
+                voices_to_remove.append(note_index)
+                continue
 
-                # Linear interpolation between samples
-                sample0 = self.audio_data[int_pos]
-                sample1 = self.audio_data[min(int_pos + 1, effective_end - 1)]
-                outdata[i] = sample0 + frac * (sample1 - sample0)
+            # Create a buffer for this voice
+            voice_buffer = np.zeros((frames, 2), dtype=np.float32)
+            effective_end = voice.loop_end if voice.loop_end > 0 else total_samples
 
-                self.current_position += self.playback_rate
+            if voice.playback_rate == 1.0:
+                # Normal playback (position mode)
+                filled = 0
+                int_pos = int(voice.current_position)
+                while filled < frames:
+                    end_pos = int_pos + (frames - filled)
+                    if end_pos >= effective_end:
+                        # Copy remaining samples before loop
+                        remaining = effective_end - int_pos
+                        if remaining > 0:
+                            voice_buffer[filled:filled + remaining] = self.audio_data[int_pos:int_pos + remaining]
+                            filled += remaining
+                        # Loop back to loop_start
+                        int_pos = voice.loop_start
+                    else:
+                        chunk = frames - filled
+                        voice_buffer[filled:filled + chunk] = self.audio_data[int_pos:int_pos + chunk]
+                        int_pos += chunk
+                        filled += chunk
+                voice.current_position = float(int_pos)
+            else:
+                # Pitch-shifted playback with linear interpolation
+                for i in range(frames):
+                    int_pos = int(voice.current_position)
+                    frac = voice.current_position - int_pos
 
-        # Apply fade-in envelope
-        if self.is_fading_in:
-            for i in range(frames):
-                if self.fade_position < self.FADE_SAMPLES:
-                    # Linear fade from 0 to 1
-                    gain = self.fade_position / self.FADE_SAMPLES
-                    outdata[i] *= gain
-                    self.fade_position += 1
-                else:
-                    # Fade-in complete
-                    self.is_fading_in = False
-                    break
+                    if int_pos >= effective_end - 1:
+                        # Loop back to loop_start
+                        voice.current_position = float(voice.loop_start)
+                        int_pos = voice.loop_start
+                        frac = 0.0
 
-        # Apply fade-out envelope
-        if self.is_fading_out:
-            for i in range(frames):
-                if self.fade_position < self.FADE_SAMPLES:
-                    # Linear fade from 1 to 0
-                    gain = 1.0 - (self.fade_position / self.FADE_SAMPLES)
-                    outdata[i] *= gain
-                    self.fade_position += 1
-                else:
-                    # Fade-out complete, stop playback
-                    outdata[i:].fill(0)
-                    self.is_playing = False
-                    self.is_fading_out = False
-                    break
+                    # Linear interpolation between samples
+                    sample0 = self.audio_data[int_pos]
+                    sample1 = self.audio_data[min(int_pos + 1, effective_end - 1)]
+                    voice_buffer[i] = sample0 + frac * (sample1 - sample0)
+
+                    voice.current_position += voice.playback_rate
+
+            # Apply fade-in envelope
+            if voice.is_fading_in:
+                for i in range(frames):
+                    if voice.fade_position < self.FADE_SAMPLES:
+                        gain = voice.fade_position / self.FADE_SAMPLES
+                        voice_buffer[i] *= gain
+                        voice.fade_position += 1
+                    else:
+                        voice.is_fading_in = False
+                        break
+
+            # Apply fade-out envelope
+            if voice.is_fading_out:
+                for i in range(frames):
+                    if voice.fade_position < self.FADE_SAMPLES:
+                        gain = 1.0 - (voice.fade_position / self.FADE_SAMPLES)
+                        voice_buffer[i] *= gain
+                        voice.fade_position += 1
+                    else:
+                        # Fade-out complete, mark for removal
+                        voice_buffer[i:].fill(0)
+                        voice.is_active = False
+                        voices_to_remove.append(note_index)
+                        break
+
+            # Mix this voice into the output
+            outdata += voice_buffer
+
+        # Remove inactive voices
+        for note_index in voices_to_remove:
+            if note_index in self.voices:
+                del self.voices[note_index]
 
         # Apply master volume
         if self.volume < 1.0:
             outdata *= self.volume
+
+        # Clip to prevent distortion when many voices are active
+        np.clip(outdata, -1.0, 1.0, out=outdata)
 
 
 class WaveformWidget(QWidget):
@@ -919,9 +956,11 @@ class SamplerWindow(QMainWindow):
         note_index = midi_note - 60
         if midi_note in self.active_midi_notes:
             self.active_midi_notes.discard(midi_note)
-            # Only stop if no keys or MIDI notes are active
+            # Stop only this specific note (polyphonic)
+            if 0 <= note_index <= 12:
+                self.audio_player.stop_note(note_index)
+            # Update status
             if not self.active_keys and not self.active_midi_notes:
-                self.audio_player.stop()
                 self.status_label.setText("Ready")
             # Update keyboard visualization
             active_notes = {self.key_to_note[k] for k in self.active_keys}
@@ -929,7 +968,7 @@ class SamplerWindow(QMainWindow):
             self.keyboard_widget.set_active_notes(active_notes)
 
     def keyPressEvent(self, event: QKeyEvent):
-        """Handle key press for playing notes."""
+        """Handle key press for playing notes (polyphonic)."""
         if event.isAutoRepeat():
             return
 
@@ -939,23 +978,28 @@ class SamplerWindow(QMainWindow):
             self.active_keys.add(key)
             self.audio_player.play_from(note)
             self.status_label.setText(f"Playing: {NOTE_NAMES[note]}")
-            # Update keyboard visualization
+            # Update keyboard visualization (include MIDI notes)
             active_notes = {self.key_to_note[k] for k in self.active_keys}
+            active_notes.update(n - 60 for n in self.active_midi_notes if 0 <= n - 60 <= 12)
             self.keyboard_widget.set_active_notes(active_notes)
 
     def keyReleaseEvent(self, event: QKeyEvent):
-        """Handle key release to stop playback."""
+        """Handle key release to stop specific note (polyphonic)."""
         if event.isAutoRepeat():
             return
 
         key = event.key()
         if key in self.active_keys:
+            note = self.key_to_note[key]
             self.active_keys.discard(key)
-            if not self.active_keys:
-                self.audio_player.stop()
+            # Stop only this specific note (polyphonic)
+            self.audio_player.stop_note(note)
+            # Update status
+            if not self.active_keys and not self.active_midi_notes:
                 self.status_label.setText("Ready")
             # Update keyboard visualization
             active_notes = {self.key_to_note[k] for k in self.active_keys}
+            active_notes.update(n - 60 for n in self.active_midi_notes if 0 <= n - 60 <= 12)
             self.keyboard_widget.set_active_notes(active_notes)
 
     def closeEvent(self, event):
