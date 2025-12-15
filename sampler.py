@@ -5,11 +5,23 @@ Usage:
     python sampler.py
 
 Controls:
+    Computer Keyboard (one octave):
     - White keys: a=C4, s=D4, d=E4, f=F4, g=G4, h=A4, j=B4, k=C5
     - Black keys: w=C#4, e=D#4, t=F#4, y=G#4, u=A#4
     - Hold key to play (loops), release to stop
-    - Drag waveform handles to set loop region start/end
+
+    MIDI Keyboard (full 7+ octave range):
+    - All MIDI notes (0-127) supported
+    - C4 (MIDI note 60) plays at original pitch
+    - Notes below/above C4 are pitch-shifted accordingly
+
+    Waveform:
+    - Drag handles to set loop region start/end
     - Drag inside the region to move the whole selection
+
+    Loop Toggle:
+    - Enabled (default): Audio loops while key/note is held
+    - Disabled: Audio plays once (one-shot mode)
 """
 
 import os
@@ -31,8 +43,21 @@ from src.pipeline.pipeline import StableAudioPipeline
 import mido
 
 
-# Note names for display
-NOTE_NAMES = ['C4', 'C#4', 'D4', 'D#4', 'E4', 'F4', 'F#4', 'G4', 'G#4', 'A4', 'A#4', 'B4', 'C5']
+# Note names for display - generate full MIDI range (0-127)
+def _generate_note_names():
+    """Generate note names for all 128 MIDI notes (C-1 to G9)."""
+    base_notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+    names = []
+    for midi_note in range(128):
+        octave = (midi_note // 12) - 1  # MIDI note 0 = C-1, note 60 = C4
+        note = base_notes[midi_note % 12]
+        names.append(f"{note}{octave}")
+    return names
+
+NOTE_NAMES = _generate_note_names()
+
+# Reference MIDI note for original pitch (C4 = 60)
+MIDI_NOTE_C4 = 60
 
 
 class MidiInputThread(QThread):
@@ -122,7 +147,7 @@ class AudioPlayer:
     FADE_SAMPLES = 220
 
     # Maximum number of simultaneous voices
-    MAX_VOICES = 13  # One for each note in the octave
+    MAX_VOICES = 16  # Reasonable polyphony limit
 
     # Keyboard modes
     MODE_POSITION = 0  # Start from different positions in the sample
@@ -136,6 +161,7 @@ class AudioPlayer:
         self.stream = None
         self.mode = self.MODE_POSITION
         self.volume = 1.0  # Master volume (0.0 to 1.0)
+        self.loop_enabled = True  # Whether to loop or play once
 
         # Polyphonic voice management
         self.voices = {}  # note_index -> Voice
@@ -159,7 +185,11 @@ class AudioPlayer:
             self.region_end = min(1.0, self.region_start + 0.01)
 
     def play_from(self, note_index):
-        """Start playback for a note (0-12) based on current mode. Polyphonic."""
+        """Start playback for a note based on current mode. Polyphonic.
+
+        Args:
+            note_index: Semitone offset from C4 (0 = C4, can be negative for lower notes)
+        """
         if self.audio_data is None:
             return
 
@@ -171,12 +201,16 @@ class AudioPlayer:
 
         if self.mode == self.MODE_POSITION:
             # Position mode: start from different positions within the region
-            loop_start = region_start_sample + int((note_index / 12) * region_length)
+            # For keyboard (0-12), spread across the region
+            # For MIDI notes outside this range, clamp to region boundaries
+            position_ratio = max(0.0, min(1.0, note_index / 12.0))
+            loop_start = region_start_sample + int(position_ratio * region_length)
             loop_end = region_end_sample
             playback_rate = 1.0
         else:
             # Pitch mode: start from region start, adjust playback rate
-            # note_index 0 = C4 (original pitch), each semitone up = 2^(1/12) faster
+            # note_index 0 = C4 (original pitch), each semitone = 2^(1/12) rate change
+            # Supports full MIDI range (e.g., -60 to +67 semitones from C4)
             loop_start = region_start_sample
             loop_end = region_end_sample
             playback_rate = 2.0 ** (note_index / 12.0)
@@ -252,13 +286,21 @@ class AudioPlayer:
                 while filled < frames:
                     end_pos = int_pos + (frames - filled)
                     if end_pos >= effective_end:
-                        # Copy remaining samples before loop
+                        # Copy remaining samples before end
                         remaining = effective_end - int_pos
                         if remaining > 0:
                             voice_buffer[filled:filled + remaining] = self.audio_data[int_pos:int_pos + remaining]
                             filled += remaining
-                        # Loop back to loop_start
-                        int_pos = voice.loop_start
+                        if self.loop_enabled:
+                            # Loop back to loop_start
+                            int_pos = voice.loop_start
+                        else:
+                            # One-shot mode: trigger fade-out
+                            if not voice.is_fading_out:
+                                voice.is_fading_out = True
+                                voice.is_fading_in = False
+                                voice.fade_position = 0
+                            break
                     else:
                         chunk = frames - filled
                         voice_buffer[filled:filled + chunk] = self.audio_data[int_pos:int_pos + chunk]
@@ -272,10 +314,18 @@ class AudioPlayer:
                     frac = voice.current_position - int_pos
 
                     if int_pos >= effective_end - 1:
-                        # Loop back to loop_start
-                        voice.current_position = float(voice.loop_start)
-                        int_pos = voice.loop_start
-                        frac = 0.0
+                        if self.loop_enabled:
+                            # Loop back to loop_start
+                            voice.current_position = float(voice.loop_start)
+                            int_pos = voice.loop_start
+                            frac = 0.0
+                        else:
+                            # One-shot mode: trigger fade-out
+                            if not voice.is_fading_out:
+                                voice.is_fading_out = True
+                                voice.is_fading_in = False
+                                voice.fade_position = 0
+                            break
 
                     # Linear interpolation between samples
                     sample0 = self.audio_data[int_pos]
@@ -593,7 +643,7 @@ class KeyboardWidget(QWidget):
             font = QFont()
             font.setPointSize(10)
             painter.setFont(font)
-            painter.drawText(int(x + white_key_width // 2 - 10), int(white_key_height - 25), NOTE_NAMES[note])
+            painter.drawText(int(x + white_key_width // 2 - 10), int(white_key_height - 25), NOTE_NAMES[note + MIDI_NOTE_C4])
 
             # Key label
             painter.setPen(QColor(50, 50, 50))
@@ -748,6 +798,12 @@ class SamplerWindow(QMainWindow):
         self.mode_selector.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Prevent stealing keyboard focus
         mode_layout.addWidget(mode_label)
         mode_layout.addWidget(self.mode_selector, 1)
+        # Loop toggle checkbox
+        self.loop_checkbox = QCheckBox("Loop")
+        self.loop_checkbox.setChecked(True)
+        self.loop_checkbox.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.loop_checkbox.toggled.connect(self._on_loop_toggled)
+        mode_layout.addWidget(self.loop_checkbox)
         layout.addLayout(mode_layout)
 
         # MIDI input selector
@@ -902,6 +958,10 @@ class SamplerWindow(QMainWindow):
         self.bpm_slider.setEnabled(checked)
         self.bpm_value_label.setEnabled(checked)
 
+    def _on_loop_toggled(self, checked):
+        """Handle loop checkbox toggle."""
+        self.audio_player.loop_enabled = checked
+
     def _on_waveform_region_changed(self, start, end):
         """Handle waveform region changes from dragging."""
         self.audio_player.set_region(start, end)
@@ -940,31 +1000,32 @@ class SamplerWindow(QMainWindow):
         """Handle MIDI note on event."""
         if self.audio_player.audio_data is None:
             return
-        # Map MIDI note to note index (C4 = 60 -> index 0)
-        note_index = midi_note - 60
-        if 0 <= note_index <= 12:
-            self.active_midi_notes.add(midi_note)
-            self.audio_player.play_from(note_index)
-            self.status_label.setText(f"Playing: {NOTE_NAMES[note_index]}")
-            # Update keyboard visualization
-            active_notes = {self.key_to_note[k] for k in self.active_keys}
-            active_notes.update(n - 60 for n in self.active_midi_notes if 0 <= n - 60 <= 12)
-            self.keyboard_widget.set_active_notes(active_notes)
+        # Map MIDI note to note index (C4 = 60 -> index 0, for pitch calculation)
+        # Full MIDI range supported (0-127)
+        if not (0 <= midi_note <= 127):
+            return
+        note_index = midi_note - MIDI_NOTE_C4  # Can be negative for notes below C4
+        self.active_midi_notes.add(midi_note)
+        self.audio_player.play_from(note_index)
+        self.status_label.setText(f"Playing: {NOTE_NAMES[midi_note]}")
+        # Update keyboard visualization (only show notes in visual keyboard range)
+        active_notes = {self.key_to_note[k] for k in self.active_keys}
+        active_notes.update(n - MIDI_NOTE_C4 for n in self.active_midi_notes if 0 <= n - MIDI_NOTE_C4 <= 12)
+        self.keyboard_widget.set_active_notes(active_notes)
 
     def _on_midi_note_off(self, midi_note):
         """Handle MIDI note off event."""
-        note_index = midi_note - 60
+        note_index = midi_note - MIDI_NOTE_C4
         if midi_note in self.active_midi_notes:
             self.active_midi_notes.discard(midi_note)
             # Stop only this specific note (polyphonic)
-            if 0 <= note_index <= 12:
-                self.audio_player.stop_note(note_index)
+            self.audio_player.stop_note(note_index)
             # Update status
             if not self.active_keys and not self.active_midi_notes:
                 self.status_label.setText("Ready")
-            # Update keyboard visualization
+            # Update keyboard visualization (only show notes in visual keyboard range)
             active_notes = {self.key_to_note[k] for k in self.active_keys}
-            active_notes.update(n - 60 for n in self.active_midi_notes if 0 <= n - 60 <= 12)
+            active_notes.update(n - MIDI_NOTE_C4 for n in self.active_midi_notes if 0 <= n - MIDI_NOTE_C4 <= 12)
             self.keyboard_widget.set_active_notes(active_notes)
 
     def keyPressEvent(self, event: QKeyEvent):
@@ -977,10 +1038,10 @@ class SamplerWindow(QMainWindow):
             note = self.key_to_note[key]
             self.active_keys.add(key)
             self.audio_player.play_from(note)
-            self.status_label.setText(f"Playing: {NOTE_NAMES[note]}")
-            # Update keyboard visualization (include MIDI notes)
+            self.status_label.setText(f"Playing: {NOTE_NAMES[note + MIDI_NOTE_C4]}")
+            # Update keyboard visualization (include MIDI notes in visual keyboard range)
             active_notes = {self.key_to_note[k] for k in self.active_keys}
-            active_notes.update(n - 60 for n in self.active_midi_notes if 0 <= n - 60 <= 12)
+            active_notes.update(n - MIDI_NOTE_C4 for n in self.active_midi_notes if 0 <= n - MIDI_NOTE_C4 <= 12)
             self.keyboard_widget.set_active_notes(active_notes)
 
     def keyReleaseEvent(self, event: QKeyEvent):
@@ -997,9 +1058,9 @@ class SamplerWindow(QMainWindow):
             # Update status
             if not self.active_keys and not self.active_midi_notes:
                 self.status_label.setText("Ready")
-            # Update keyboard visualization
+            # Update keyboard visualization (include MIDI notes in visual keyboard range)
             active_notes = {self.key_to_note[k] for k in self.active_keys}
-            active_notes.update(n - 60 for n in self.active_midi_notes if 0 <= n - 60 <= 12)
+            active_notes.update(n - MIDI_NOTE_C4 for n in self.active_midi_notes if 0 <= n - MIDI_NOTE_C4 <= 12)
             self.keyboard_widget.set_active_notes(active_notes)
 
     def closeEvent(self, event):
